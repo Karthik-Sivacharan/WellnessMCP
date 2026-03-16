@@ -1,0 +1,36 @@
+{
+  "name": "wellness-mcp",
+  "version": "0.1.0",
+  "description": "Local-first, privacy-first health data MCP server. Your health data never leaves your machine.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "wellness-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.7.0",
+    "keytar": "^7.9.0",
+    "zod": "^3.24.2",
+    "fast-xml-parser": "^5.1.0",
+    "open": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}

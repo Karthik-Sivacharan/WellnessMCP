@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "defaults": {
+    "pii_redaction": true,
+    "aggregation": true,
+    "audit_logging": true
+  },
+  "scopes": {
+    "sleep": { "enabled": true, "granularity": "aggregated" },
+    "activity": { "enabled": true, "granularity": "aggregated" },
+    "vitals": { "enabled": true, "granularity": "aggregated" },
+    "body_composition": { "enabled": true, "granularity": "aggregated" },
+    "glucose": { "enabled": true, "granularity": "aggregated" },
+    "health_metrics": { "enabled": true, "granularity": "aggregated" },
+    "devices": { "enabled": true, "granularity": "raw" }
+  },
+  "pii_fields": [
+    "name", "email", "phone", "dob", "date_of_birth", "birth_date",
+    "address", "gps", "latitude", "longitude", "serial_number",
+    "device_id", "mac_address", "ssn", "social_security"
+  ]
+}
