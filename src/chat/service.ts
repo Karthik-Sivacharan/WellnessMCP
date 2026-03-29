@@ -3,12 +3,11 @@
  *
  * Chat Service — orchestrates the flow from user question to AI response.
  *
- * Architecture:
- *   User question
- *     --> HealthContextBuilder (SQLite + Privacy filtering)
- *       --> System prompt construction (health data + instructions)
- *         --> Claude API call (via @anthropic-ai/sdk)
- *           --> Response text returned to caller
+ * Architecture (stateless):
+ *   User question + pre-built health context + API key
+ *     --> System prompt construction (health data + instructions)
+ *       --> Claude API call (via @anthropic-ai/sdk)
+ *         --> Response text returned to caller
  *
  * Key design decisions:
  *   - A new Anthropic client is created per request because different users
@@ -17,13 +16,11 @@
  *     reference them specifically rather than giving generic advice.
  *   - A medical disclaimer is baked into the system prompt to prevent
  *     Claude from overstepping into diagnostic territory.
- *   - The health context is built from privacy-filtered data — PII is
- *     redacted and consent gates are enforced before any data reaches
- *     the LLM.
+ *   - The health context is pre-built and passed in — this class does NOT
+ *     query a database or build context itself.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import { HealthContextBuilder } from "./context.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -65,8 +62,6 @@ const MAX_TOKENS = 2048;
 export interface ChatOptions {
   /** Override the default Claude model */
   model?: string;
-  /** Number of days of health history to include in context (default: 14) */
-  days?: number;
 }
 
 /**
@@ -77,8 +72,6 @@ export interface ChatResponse {
   response: string;
   /** The Claude model that generated the response */
   model: string;
-  /** How many days of health context were included */
-  contextDays: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,69 +79,60 @@ export interface ChatResponse {
 // ---------------------------------------------------------------------------
 
 /**
- * Core chat service that processes user questions about their health data.
+ * Stateless chat service that processes user questions about their health data.
+ *
+ * This class has no constructor dependencies — it is a pure orchestrator
+ * that takes a message, pre-built health context, and API key, then calls
+ * the Claude API and returns the response.
  *
  * Usage:
  * ```ts
- * const service = new ChatService(contextBuilder);
+ * const service = new ChatService();
  * const result = await service.chat(
  *   "How has my sleep been this week?",
+ *   healthContextString,
  *   "sk-ant-api03-...",
- *   { model: "claude-sonnet-4-20250514", days: 7 }
+ *   { model: "claude-sonnet-4-20250514" }
  * );
  * console.log(result.response);
  * ```
- *
- * The service:
- *   1. Builds a health context from SQLite (privacy-filtered)
- *   2. Constructs a system prompt with the health data + instructions
- *   3. Calls the Claude API with the user's own API key
- *   4. Returns the structured response
  */
 export class ChatService {
-  private contextBuilder: HealthContextBuilder;
-
-  constructor(contextBuilder: HealthContextBuilder) {
-    this.contextBuilder = contextBuilder;
-  }
-
   /**
-   * Processes a user question about their health data.
+   * Processes a user question with pre-built health context.
    *
    * Flow:
-   *   1. Build health context from SQLite via HealthContextBuilder
-   *   2. Construct system prompt with health data and behavioral instructions
-   *   3. Call Claude API with the user's API key
-   *   4. Return the response text along with metadata
+   *   1. Construct system prompt with health data and behavioral instructions
+   *   2. Call Claude API with the user's API key
+   *   3. Return the response text along with metadata
    *
    * Error handling:
-   *   - Invalid API key: throws with a message containing "authentication" or "invalid"
-   *   - Rate limiting: throws with a message containing "rate"
+   *   - Invalid API key: throws with a message containing "Invalid Anthropic API key"
+   *   - Rate limiting: throws with a message containing "rate limit"
    *   - Other API errors: re-thrown with descriptive messages
    *
    * @param message - The user's question about their health data
+   * @param healthContext - Pre-built health context string (from HealthContextBuilder)
    * @param apiKey - The user's Anthropic API key (used to create a per-request client)
-   * @param options - Optional overrides for model and context window
+   * @param options - Optional overrides for model selection
    * @returns Structured ChatResponse with the AI answer and metadata
    * @throws Error if the API call fails (invalid key, rate limit, network error, etc.)
    */
-  async chat(message: string, apiKey: string, options?: ChatOptions): Promise<ChatResponse> {
+  async chat(
+    message: string,
+    healthContext: string,
+    apiKey: string,
+    options?: ChatOptions,
+  ): Promise<ChatResponse> {
     const model = options?.model ?? DEFAULT_MODEL;
-    const days = options?.days ?? 14;
 
-    // Step 1: Build the health context from SQLite.
-    // This queries all health categories, applies privacy filtering (consent
-    // gate + PII redaction + aggregation), and formats them into a concise
-    // text summary.
-    const healthContext = await this.contextBuilder.buildContext(days);
-
-    // Step 2: Construct the system prompt.
+    // Step 1: Construct the system prompt.
     // The prompt includes the health data context and behavioral instructions
     // for Claude. We keep it focused: reference actual data, be specific,
     // but don't diagnose.
     const systemPrompt = this.buildSystemPrompt(healthContext);
 
-    // Step 3: Call the Claude API.
+    // Step 2: Call the Claude API.
     // Create a new client per request — different users have different API keys,
     // so we cannot reuse a single client instance.
     const client = new Anthropic({ apiKey });
@@ -168,7 +152,6 @@ export class ChatService {
       const responseText = response.content
         .filter((block) => block.type === "text")
         .map((block) => {
-          // TypeScript narrowing: we already filtered for type === "text"
           if (block.type === "text") return block.text;
           return "";
         })
@@ -177,7 +160,6 @@ export class ChatService {
       return {
         response: responseText,
         model: response.model,
-        contextDays: days,
       };
     } catch (err: unknown) {
       // Re-throw with more descriptive error messages for common failure modes.

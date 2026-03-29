@@ -1,42 +1,35 @@
 /**
  * @module ingest/server
  *
- * HTTP ingest server for receiving health data from the AthletiqX iOS app.
+ * Stateless HTTP proxy server for the WellnessMCP health chat service.
  *
  * Architecture:
- *   This server runs alongside the MCP stdio server. While the MCP server
- *   communicates with Claude via stdin/stdout, this HTTP server listens on
- *   a configurable port for incoming health data POSTs from the iOS app.
+ *   AthletiqX (iOS) --POST /chat--> WellnessServer
+ *     1. Authenticate request (X-API-Key header)
+ *     2. Validate payload (Zod: message + health_data + api_key)
+ *     3. Redact PII from health_data via PrivacyLayer
+ *     4. Build health context text from redacted data (HealthContextBuilder)
+ *     5. Call Claude API via ChatService with user's own API key
+ *     6. Return AI response
  *
- *   AthletiqX (iOS) --HTTP POST--> IngestServer --normalize--> StorageManager --> SQLite
- *                                                                                   |
- *   Claude <--MCP stdio--> MCP Server <-- reads from ----------------------------- /
+ * This server is completely stateless — no database, no storage. All health
+ * data arrives inline with each request from the iOS app.
  *
  * Uses Node.js built-in `http` module — no Express dependency required.
  *
  * Configuration (environment variables):
  *   - WELLNESS_MCP_INGEST_PORT: Port to listen on (default: 3456)
- *   - WELLNESS_MCP_INGEST_KEY: Optional API key for authentication
+ *   - WELLNESS_MCP_INGEST_KEY: Optional API key for authenticating requests
  *
  * Endpoints:
- *   - POST /ingest/health       — Receive and store a HealthSnapshot
- *   - GET  /ingest/health/status — Check server status and record counts
- *   - POST /chat                — Send a question, get an AI response using health data context
- *   - POST /chat/api-key        — Store an Anthropic API key server-side for convenience
- *   - GET  /chat/models         — List available Claude models
+ *   - POST /chat         — Send health data + question, get AI response
+ *   - GET  /chat/models  — List available Claude models
+ *   - GET  /health       — Simple health check
  */
 
 import http from "node:http";
 import { z } from "zod";
 import { HealthSnapshotSchema } from "./types.js";
-import type { HealthSnapshot } from "./types.js";
-import {
-  normalizeSleep,
-  normalizeActivity,
-  normalizeVitals,
-  normalizeBodyComposition,
-} from "./normalizer.js";
-import { StorageManager } from "../storage/db.js";
 import { PrivacyLayer } from "../privacy/index.js";
 import { HealthContextBuilder } from "../chat/context.js";
 import { ChatService, SUPPORTED_MODELS } from "../chat/service.js";
@@ -46,7 +39,7 @@ import type { ChatOptions } from "../chat/service.js";
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Default port for the ingest HTTP server */
+/** Default port for the HTTP server */
 const DEFAULT_PORT = 3456;
 
 /** Maximum request body size in bytes (5 MB). Prevents memory exhaustion
@@ -54,87 +47,83 @@ const DEFAULT_PORT = 3456;
 const MAX_BODY_SIZE = 5 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/** Tracks the result of the most recent ingest operation */
-interface IngestStatus {
-  /** Whether the server is currently running */
-  running: boolean;
-  /** ISO 8601 timestamp of the last successful ingest */
-  lastIngestAt: string | null;
-  /** Number of records stored in the last ingest, by category */
-  lastIngestCounts: Record<string, number>;
-  /** Total number of successful ingests since server start */
-  totalIngests: number;
-  /** Total number of failed ingest attempts since server start */
-  totalErrors: number;
-}
-
-// ---------------------------------------------------------------------------
-// IngestServer class
+// Request validation schema
 // ---------------------------------------------------------------------------
 
 /**
- * HTTP server that accepts health data from the AthletiqX iOS app,
- * validates it against the HealthSnapshot Zod schema, normalizes it
- * into WellnessMCP's format, and persists it via the StorageManager.
+ * Zod schema for validating POST /chat request bodies.
  *
- * Designed to be started/stopped by the AppleHealthProvider.
+ * The iOS app sends:
+ *   - message: The user's health question
+ *   - health_data: The full HealthSnapshot (same format as the old /ingest/health payload)
+ *   - api_key: The user's Anthropic API key for Claude
+ *   - model: (optional) Override the default Claude model
+ *   - days: (optional) Unused in stateless mode but kept for API compatibility
+ */
+const ChatRequestSchema = z.object({
+  /** The user's question about their health */
+  message: z.string().min(1, "Message is required").max(10000, "Message too long (max 10,000 chars)"),
+
+  /** Health data from the iOS app — the full HealthSnapshot */
+  health_data: HealthSnapshotSchema,
+
+  /** User's Anthropic API key for Claude */
+  api_key: z.string().min(1, "Anthropic API key is required"),
+
+  /** Optional: override the default Claude model */
+  model: z.string().optional(),
+
+  /** Optional: hint for context window (kept for API compat, not used in stateless mode) */
+  days: z.number().int().min(1).max(365).optional(),
+});
+
+// ---------------------------------------------------------------------------
+// WellnessServer class
+// ---------------------------------------------------------------------------
+
+/**
+ * Stateless HTTP proxy server that accepts health data + questions from the
+ * AthletiqX iOS app, applies PII redaction, builds a health context, calls
+ * the Claude API, and returns the AI response.
+ *
+ * No database. No storage. All data arrives inline with each request.
  */
 export class IngestServer {
   private server: http.Server | null = null;
-  private storage: StorageManager;
   private privacy: PrivacyLayer;
   private port: number;
   private apiKey: string | null;
 
-  /** The chat service handles question -> context -> LLM -> response */
+  /** Stateless chat service — calls Claude API */
   private chatService: ChatService;
 
-  /**
-   * In-memory store for user API keys, keyed by user_id.
-   * This allows the iOS app to store the key once and omit it from
-   * subsequent /chat requests. Keys are lost on server restart.
-   */
-  private storedApiKeys: Map<string, string> = new Map();
-
-  /** Tracks status information for the /status endpoint */
-  private status: IngestStatus = {
-    running: false,
-    lastIngestAt: null,
-    lastIngestCounts: {},
-    totalIngests: 0,
-    totalErrors: 0,
-  };
+  /** Stateless context builder — formats HealthSnapshot as text */
+  private contextBuilder: HealthContextBuilder;
 
   /**
-   * Creates a new IngestServer instance.
+   * Creates a new WellnessServer instance.
    *
-   * @param storage - The StorageManager instance for persisting normalized data
-   * @param privacy - The PrivacyLayer instance for consent/redaction/aggregation
+   * @param privacy - The PrivacyLayer instance for PII redaction
    * @param port - Port to listen on (defaults to WELLNESS_MCP_INGEST_PORT env var or 3456)
    * @param apiKey - Optional API key for authenticating requests (defaults to WELLNESS_MCP_INGEST_KEY env var)
    */
-  constructor(storage: StorageManager, privacy: PrivacyLayer, port?: number, apiKey?: string) {
-    this.storage = storage;
+  constructor(privacy: PrivacyLayer, port?: number, apiKey?: string) {
     this.privacy = privacy;
     this.port = port ?? parseInt(process.env.WELLNESS_MCP_INGEST_PORT ?? String(DEFAULT_PORT), 10);
     this.apiKey = apiKey ?? process.env.WELLNESS_MCP_INGEST_KEY ?? null;
 
-    // Initialize the chat service pipeline:
-    //   HealthContextBuilder (queries SQLite + applies privacy filtering)
-    //   -> ChatService (constructs prompt + calls Claude API)
-    const contextBuilder = new HealthContextBuilder(storage, privacy);
-    this.chatService = new ChatService(contextBuilder);
+    // Both are stateless — no constructor dependencies
+    this.chatService = new ChatService();
+    this.contextBuilder = new HealthContextBuilder();
   }
 
   /**
-   * Starts the HTTP ingest server.
+   * Starts the HTTP server.
    *
-   * The server handles two routes:
-   *   - POST /ingest/health       — Accepts HealthSnapshot JSON
-   *   - GET  /ingest/health/status — Returns server status
+   * The server handles three routes:
+   *   - POST /chat         — Accept health data + question, return AI response
+   *   - GET  /chat/models  — List available Claude models
+   *   - GET  /health       — Simple health check
    *
    * All other routes receive a 404 response.
    *
@@ -157,13 +146,12 @@ export class IngestServer {
       });
 
       this.server.listen(this.port, () => {
-        this.status.running = true;
         // Log to stderr so it doesn't interfere with MCP stdio on stdout
-        console.error(`[IngestServer] Listening on port ${this.port}`);
+        console.error(`[WellnessServer] Listening on port ${this.port}`);
         if (this.apiKey) {
-          console.error(`[IngestServer] API key authentication is enabled`);
+          console.error(`[WellnessServer] API key authentication is enabled`);
         } else {
-          console.error(`[IngestServer] WARNING: No API key configured (set WELLNESS_MCP_INGEST_KEY)`);
+          console.error(`[WellnessServer] WARNING: No API key configured (set WELLNESS_MCP_INGEST_KEY)`);
         }
         resolve();
       });
@@ -171,7 +159,7 @@ export class IngestServer {
   }
 
   /**
-   * Stops the HTTP ingest server gracefully.
+   * Stops the HTTP server gracefully.
    *
    * @returns A promise that resolves once the server has closed
    */
@@ -184,8 +172,7 @@ export class IngestServer {
 
       this.server.close(() => {
         this.server = null;
-        this.status.running = false;
-        console.error("[IngestServer] Server stopped");
+        console.error("[WellnessServer] Server stopped");
         resolve();
       });
     });
@@ -195,7 +182,7 @@ export class IngestServer {
    * Returns whether the server is currently running.
    */
   isRunning(): boolean {
-    return this.status.running;
+    return this.server !== null;
   }
 
   /**
@@ -203,14 +190,6 @@ export class IngestServer {
    */
   getPort(): number {
     return this.port;
-  }
-
-  /**
-   * Returns a snapshot of the current ingest status for the /status endpoint
-   * and for the AppleHealthProvider's sync() method.
-   */
-  getStatus(): IngestStatus {
-    return { ...this.status };
   }
 
   // -------------------------------------------------------------------------
@@ -222,11 +201,10 @@ export class IngestServer {
    * the HTTP method and URL path.
    *
    * Also sets CORS headers on every response to allow the iOS app to
-   * communicate from the local network.
+   * communicate from any origin.
    */
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    // Set CORS headers for local network access.
-    // The iOS app may send requests from a different origin on the local network.
+    // Set CORS headers for cross-origin access from the iOS app
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
@@ -240,27 +218,9 @@ export class IngestServer {
 
     const url = req.url ?? "";
 
-    // Route: POST /ingest/health — receive health data
-    if (req.method === "POST" && url === "/ingest/health") {
-      this.handleIngest(req, res);
-      return;
-    }
-
-    // Route: GET /ingest/health/status — check server status
-    if (req.method === "GET" && url === "/ingest/health/status") {
-      this.handleStatus(req, res);
-      return;
-    }
-
     // Route: POST /chat — process a health question through the LLM
     if (req.method === "POST" && url === "/chat") {
       this.handleChat(req, res);
-      return;
-    }
-
-    // Route: POST /chat/api-key — store an Anthropic API key server-side
-    if (req.method === "POST" && url === "/chat/api-key") {
-      this.handleStoreApiKey(req, res);
       return;
     }
 
@@ -270,182 +230,41 @@ export class IngestServer {
       return;
     }
 
+    // Route: GET /health — simple health check
+    if (req.method === "GET" && url === "/health") {
+      this.sendJson(res, 200, { status: "ok" });
+      return;
+    }
+
     // All other routes: 404
     this.sendJson(res, 404, { error: "Not found", path: url });
   }
 
-  /**
-   * Handles POST /ingest/health requests.
-   *
-   * Processing pipeline:
-   *   1. Authenticate (if API key is configured)
-   *   2. Read and parse the JSON body (with size limit)
-   *   3. Validate against the HealthSnapshot Zod schema
-   *   4. Normalize all data categories
-   *   5. Persist to SQLite via StorageManager
-   *   6. Return a summary of what was stored
-   */
-  private handleIngest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    // Step 1: Check API key authentication
-    if (!this.authenticateRequest(req)) {
-      this.sendJson(res, 401, {
-        error: "Unauthorized",
-        message: "Missing or invalid API key. Set the X-API-Key header or Authorization: Bearer <key>.",
-      });
-      return;
-    }
-
-    // Step 2: Read the request body with size limit enforcement
-    this.readBody(req)
-      .then((body) => {
-        // Step 3: Parse JSON
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(body);
-        } catch {
-          this.status.totalErrors++;
-          this.sendJson(res, 400, {
-            error: "Invalid JSON",
-            message: "Request body is not valid JSON.",
-          });
-          return;
-        }
-
-        // Step 4: Validate against the HealthSnapshot Zod schema
-        const validation = HealthSnapshotSchema.safeParse(parsed);
-        if (!validation.success) {
-          this.status.totalErrors++;
-          // Return Zod's structured error messages to help debug the iOS payload
-          this.sendJson(res, 422, {
-            error: "Validation failed",
-            message: "The payload does not match the expected HealthSnapshot format.",
-            details: validation.error.issues.map((issue) => ({
-              path: issue.path.join("."),
-              message: issue.message,
-            })),
-          });
-          return;
-        }
-
-        // Step 5: Normalize and store
-        const snapshot = validation.data;
-        const counts = this.processSnapshot(snapshot);
-
-        // Step 6: Update status and respond
-        this.status.lastIngestAt = new Date().toISOString();
-        this.status.lastIngestCounts = counts;
-        this.status.totalIngests++;
-
-        this.sendJson(res, 200, {
-          success: true,
-          message: "Health data ingested successfully.",
-          fetched_at: snapshot.fetched_at,
-          records_stored: counts,
-          total_records: Object.values(counts).reduce((a, b) => a + b, 0),
-        });
-      })
-      .catch((err) => {
-        this.status.totalErrors++;
-        if (err instanceof Error && err.message === "BODY_TOO_LARGE") {
-          this.sendJson(res, 413, {
-            error: "Payload too large",
-            message: `Request body exceeds the ${MAX_BODY_SIZE / 1024 / 1024}MB limit.`,
-          });
-        } else {
-          this.sendJson(res, 500, {
-            error: "Internal server error",
-            message: err instanceof Error ? err.message : "Unknown error",
-          });
-        }
-      });
-  }
-
-  /**
-   * Handles GET /ingest/health/status requests.
-   *
-   * Returns the current server status, last ingest time, record counts,
-   * and overall data inventory from the storage layer.
-   */
-  private handleStatus(_req: http.IncomingMessage, res: http.ServerResponse): void {
-    // Get data inventory from storage for a complete picture
-    const inventory = this.storage.getDataInventory();
-    const device = this.storage.getDevice("apple_health");
-
-    this.sendJson(res, 200, {
-      status: "ok",
-      provider: "apple_health",
-      server: {
-        running: this.status.running,
-        port: this.port,
-        api_key_configured: this.apiKey !== null,
-      },
-      last_ingest: {
-        at: this.status.lastIngestAt,
-        records: this.status.lastIngestCounts,
-      },
-      totals: {
-        successful_ingests: this.status.totalIngests,
-        failed_ingests: this.status.totalErrors,
-      },
-      device: device
-        ? {
-            last_sync: device.last_sync,
-            status: device.status,
-          }
-        : null,
-      data_inventory: inventory,
-    });
-  }
-
   // -------------------------------------------------------------------------
-  // Chat endpoint handlers
+  // Chat endpoint handler
   // -------------------------------------------------------------------------
-
-  /**
-   * Zod schema for validating POST /chat request bodies.
-   * - message: Required question from the user
-   * - api_key: Anthropic API key (optional if previously stored via /chat/api-key)
-   * - user_id: Used to look up a stored API key (optional)
-   * - model: Override the default Claude model (optional)
-   * - days: Override the health context time window (optional)
-   */
-  private static ChatRequestSchema = z.object({
-    message: z.string().min(1, "Message is required").max(10000, "Message too long (max 10,000 chars)"),
-    api_key: z.string().optional(),
-    user_id: z.string().optional(),
-    model: z.string().optional(),
-    days: z.number().int().min(1).max(365).optional(),
-  });
-
-  /**
-   * Zod schema for validating POST /chat/api-key request bodies.
-   * - api_key: The Anthropic API key to store
-   * - user_id: Identifier for the user (defaults to "default")
-   */
-  private static StoreApiKeySchema = z.object({
-    api_key: z.string().min(1, "API key is required"),
-    user_id: z.string().optional(),
-  });
 
   /**
    * Handles POST /chat requests.
    *
    * Processing pipeline:
-   *   1. Authenticate request (if ingest API key is configured)
-   *   2. Parse and validate JSON body with Zod
-   *   3. Resolve the Anthropic API key (from request body or stored keys)
-   *   4. Call ChatService.chat() which builds context, calls Claude, returns response
-   *   5. Return the AI response to the client
+   *   1. Authenticate request (X-API-Key header, if configured)
+   *   2. Parse + validate JSON body with Zod (message + health_data + api_key)
+   *   3. Apply PII redaction to health_data via privacy.redact()
+   *   4. Build health context text from the redacted HealthSnapshot
+   *   5. Call ChatService.chat() with message + context + user's API key
+   *   6. Return the AI response
    *
    * Error mapping:
    *   - 400: Invalid JSON or missing required fields
-   *   - 401: Missing/invalid ingest API key OR invalid Anthropic API key
+   *   - 401: Missing/invalid server API key OR invalid Anthropic API key
+   *   - 413: Payload too large
    *   - 422: Zod validation failure (detailed field errors)
    *   - 429: Anthropic API rate limit exceeded
    *   - 500: Unexpected server error
    */
   private handleChat(req: http.IncomingMessage, res: http.ServerResponse): void {
-    // Step 1: Authenticate the request against the ingest API key.
+    // Step 1: Authenticate the request against the server's API key.
     // This protects the endpoint itself. The user's Anthropic API key is
     // separate and only used for the Claude API call.
     if (!this.authenticateRequest(req)) {
@@ -472,7 +291,7 @@ export class IngestServer {
         }
 
         // Validate with Zod
-        const validation = IngestServer.ChatRequestSchema.safeParse(parsed);
+        const validation = ChatRequestSchema.safeParse(parsed);
         if (!validation.success) {
           this.sendJson(res, 422, {
             error: "Validation failed",
@@ -485,39 +304,36 @@ export class IngestServer {
           return;
         }
 
-        const { message, api_key, user_id, model, days } = validation.data;
+        const { message, health_data, api_key, model } = validation.data;
 
-        // Step 3: Resolve the Anthropic API key.
-        // Priority: request body > stored key > environment variable
-        const resolvedApiKey =
-          api_key ??
-          (user_id ? this.storedApiKeys.get(user_id) : undefined) ??
-          this.storedApiKeys.get("default") ??
-          process.env.ANTHROPIC_API_KEY;
+        // Step 3: Apply PII redaction to the health data.
+        // The PIIRedactor strips any personally identifiable information
+        // (names, emails, GPS coords, etc.) before data reaches the LLM.
+        const { data: redactedHealthData, fieldsRedacted } = this.privacy.redactor.redact(health_data);
+        const wasRedacted = fieldsRedacted.length > 0;
 
-        if (!resolvedApiKey) {
-          this.sendJson(res, 400, {
-            error: "Missing API key",
-            message:
-              "No Anthropic API key provided. Either include 'api_key' in the request body, " +
-              "store one via POST /chat/api-key, or set the ANTHROPIC_API_KEY environment variable.",
-          });
-          return;
-        }
+        // Step 4: Build health context text from the redacted snapshot.
+        // This formats the HealthSnapshot into a structured text summary
+        // that gets injected into Claude's system prompt.
+        const healthContext = this.contextBuilder.buildContext(redactedHealthData);
 
-        // Step 4: Call the chat service
+        // Step 5: Call the chat service with the pre-built context
         try {
           const options: ChatOptions = {};
           if (model) options.model = model;
-          if (days) options.days = days;
 
-          const result = await this.chatService.chat(message, resolvedApiKey, options);
+          const result = await this.chatService.chat(
+            message,
+            healthContext,
+            api_key,
+            options,
+          );
 
-          // Step 5: Return the response
+          // Step 6: Return the response
           this.sendJson(res, 200, {
             response: result.response,
             model: result.model,
-            context_days: result.contextDays,
+            was_redacted: wasRedacted,
           });
         } catch (err: unknown) {
           // Map ChatService errors to HTTP status codes
@@ -534,92 +350,13 @@ export class IngestServer {
               message: errMsg,
             });
           } else {
-            console.error("[IngestServer] Chat error:", errMsg);
+            console.error("[WellnessServer] Chat error:", errMsg);
             this.sendJson(res, 500, {
               error: "Chat failed",
               message: errMsg,
             });
           }
         }
-      })
-      .catch((err) => {
-        if (err instanceof Error && err.message === "BODY_TOO_LARGE") {
-          this.sendJson(res, 413, {
-            error: "Payload too large",
-            message: `Request body exceeds the ${MAX_BODY_SIZE / 1024 / 1024}MB limit.`,
-          });
-        } else {
-          this.sendJson(res, 500, {
-            error: "Internal server error",
-            message: err instanceof Error ? err.message : "Unknown error",
-          });
-        }
-      });
-  }
-
-  /**
-   * Handles POST /chat/api-key requests.
-   *
-   * Stores an Anthropic API key in memory so subsequent /chat requests
-   * can omit it. Keys are stored in a simple Map keyed by user_id.
-   *
-   * This is a convenience feature for the iOS app — it can store the key
-   * once after the user enters it, then all future chat requests automatically
-   * use the stored key.
-   *
-   * NOTE: Keys are stored in memory only and are lost on server restart.
-   * For persistent storage, the iOS app should store the key in its own
-   * Keychain and send it with each request.
-   */
-  private handleStoreApiKey(req: http.IncomingMessage, res: http.ServerResponse): void {
-    // Authenticate against the ingest API key
-    if (!this.authenticateRequest(req)) {
-      this.sendJson(res, 401, {
-        error: "Unauthorized",
-        message: "Missing or invalid API key. Set the X-API-Key header or Authorization: Bearer <key>.",
-      });
-      return;
-    }
-
-    this.readBody(req)
-      .then((body) => {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(body);
-        } catch {
-          this.sendJson(res, 400, {
-            error: "Invalid JSON",
-            message: "Request body is not valid JSON.",
-          });
-          return;
-        }
-
-        const validation = IngestServer.StoreApiKeySchema.safeParse(parsed);
-        if (!validation.success) {
-          this.sendJson(res, 422, {
-            error: "Validation failed",
-            message: "The request does not match the expected format.",
-            details: validation.error.issues.map((issue) => ({
-              path: issue.path.join("."),
-              message: issue.message,
-            })),
-          });
-          return;
-        }
-
-        const { api_key, user_id } = validation.data;
-        const effectiveUserId = user_id ?? "default";
-
-        // Store the key in the in-memory map
-        this.storedApiKeys.set(effectiveUserId, api_key);
-
-        console.error(`[IngestServer] Stored API key for user: ${effectiveUserId}`);
-
-        this.sendJson(res, 200, {
-          success: true,
-          message: "API key stored successfully. It will be used for subsequent /chat requests.",
-          user_id: effectiveUserId,
-        });
       })
       .catch((err) => {
         if (err instanceof Error && err.message === "BODY_TOO_LARGE") {
@@ -647,60 +384,6 @@ export class IngestServer {
       models: SUPPORTED_MODELS,
       default: "claude-sonnet-4-20250514",
     });
-  }
-
-  // -------------------------------------------------------------------------
-  // Data processing
-  // -------------------------------------------------------------------------
-
-  /**
-   * Processes a validated HealthSnapshot by normalizing all data categories
-   * and persisting them to SQLite via the StorageManager.
-   *
-   * Each category is processed independently — a failure in one category
-   * does not prevent others from being stored.
-   *
-   * @param snapshot - A validated HealthSnapshot from the Zod schema
-   * @returns An object mapping category names to the number of records stored
-   */
-  private processSnapshot(snapshot: HealthSnapshot): Record<string, number> {
-    const counts: Record<string, number> = {};
-
-    // --- Sleep ---
-    const sleepRecords = normalizeSleep(snapshot.sleep.sessions);
-    for (const record of sleepRecords) {
-      this.storage.upsertSleep(record);
-    }
-    counts.sleep = sleepRecords.length;
-
-    // --- Activity (daily summaries + individual workouts) ---
-    const activityRecords = normalizeActivity(
-      snapshot.activity,
-      snapshot.cardio_fitness,
-    );
-    for (const record of activityRecords) {
-      this.storage.upsertActivity(record);
-    }
-    counts.activity = activityRecords.length;
-
-    // --- Vitals (HRV, resting HR, SpO2) ---
-    const vitalRecords = normalizeVitals(snapshot.vitals);
-    for (const record of vitalRecords) {
-      this.storage.upsertVital(record);
-    }
-    counts.vitals = vitalRecords.length;
-
-    // --- Body Composition ---
-    const bodyRecords = normalizeBodyComposition(snapshot.body_composition);
-    for (const record of bodyRecords) {
-      this.storage.upsertBodyComposition(record);
-    }
-    counts.body_composition = bodyRecords.length;
-
-    // Update the device's last sync timestamp so MCP tools can report it
-    this.storage.updateDeviceSync("apple_health");
-
-    return counts;
   }
 
   // -------------------------------------------------------------------------
