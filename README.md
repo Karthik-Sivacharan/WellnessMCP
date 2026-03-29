@@ -1,8 +1,8 @@
 # WellnessMCP
 
-Stateless, privacy-first health data proxy. Connects your iOS health data to Claude without storing anything.
+Stateless, privacy-first health data proxy. Connects your iOS health data to any LLM without storing anything.
 
-WellnessMCP is a lightweight HTTP server that acts as a bridge between the [AthletiqX](https://github.com/syntheticfinds/athletiqx) iOS app and Claude. The iOS app sends HealthKit data + a question, the server redacts PII, builds context, calls Claude API, and returns the response. Supports 80+ Apple HealthKit data types across 14 categories. No data is ever stored on the server.
+WellnessMCP is a lightweight HTTP server that acts as a bridge between the [AthletiqX](https://github.com/syntheticfinds/athletiqx) iOS app and any LLM provider. The iOS app sends HealthKit data + a question, the server redacts PII, builds context, routes to the chosen provider, and returns the response. Supports 80+ Apple HealthKit data types across 14 categories. No data is ever stored.
 
 ## Architecture
 
@@ -11,20 +11,24 @@ WellnessMCP is a lightweight HTTP server that acts as a bridge between the [Athl
 │  AthletiqX iOS   │     POST /chat     │  WellnessMCP (stateless)     │
 │                  │ ────────────────→  │                              │
 │  Sends:          │  { health_data,    │  1. Validate (Zod)           │
-│  - HealthKit data│    message,        │  2. Redact PII               │        ┌────────────┐
-│  - Question      │    api_key }       │  3. Build health context     │ ──────→│ Claude API │
-│  - API key       │                    │  4. Call Claude API          │ ←──────│            │
-│                  │ ←────────────────  │  5. Return response          │        └────────────┘
-│  Receives:       │  { response }      │                              │
-│  - AI answer     │                    │  Nothing stored. Ever.       │
+│  - HealthKit data│    message,        │  2. Redact PII               │   ┌──────────────────┐
+│  - Question      │    api_key,        │  3. Build health context     │──→│ Anthropic (Claude)│
+│  - API key       │    provider,       │  4. Apply custom instructions│   │ OpenAI (GPT)     │
+│  - Provider      │    instructions }  │  5. Route to chosen provider │   │ Your own server  │
+│  - Instructions  │                    │  6. Return response          │   │ Local LLM        │
+│                  │ ←────────────────  │                              │   └──────────────────┘
+│  Receives:       │  { response }      │  Nothing stored. Ever.       │
+│  - AI answer     │                    │                              │
 └──────────────────┘                    └──────────────────────────────┘
 ```
 
 **Key principles:**
 - **Zero storage** — No database, no files, no cache. The server is stateless.
 - **iOS app owns the data** — HealthKit data stays on the device. Only sent per-request.
-- **Privacy by design** — PII is redacted before health data reaches Claude.
-- **Bring your own key** — Users provide their own Anthropic API key.
+- **Privacy by design** — PII is redacted before health data reaches any LLM.
+- **Provider-agnostic** — Route to Anthropic, OpenAI, or any custom endpoint.
+- **Bring your own key** — Users provide their own API key for the chosen provider.
+- **Custom instructions** — iOS app can control LLM behavior per-request.
 
 ## Quick Start
 
@@ -65,6 +69,9 @@ Send a health question with inline HealthKit data. Returns an AI-powered respons
 {
   "message": "How has my sleep been this week?",
   "api_key": "sk-ant-api03-...",
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-20250514",
+  "instructions": "Act as a sports performance coach. Be brief.",
   "health_data": {
     "vitals": {
       "hrv_samples": [{ "date": "2026-03-28T07:30:00Z", "value": 45.2 }],
@@ -104,6 +111,7 @@ Send a health question with inline HealthKit data. Returns an AI-powered respons
 {
   "response": "Based on your sleep data, you got 8 hours in bed last night with 90 minutes of deep sleep and 90 minutes of REM...",
   "model": "claude-sonnet-4-20250514",
+  "provider": "anthropic",
   "was_redacted": false
 }
 ```
@@ -120,16 +128,51 @@ Send a health question with inline HealthKit data. Returns an AI-powered respons
 
 ### GET /chat/models
 
-Returns available Claude models.
+Returns available providers and models.
 
 ```json
 {
-  "models": [
-    { "id": "claude-opus-4-20250514", "name": "Claude Opus 4", "description": "Most capable" },
-    { "id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "description": "Balanced (default)" },
-    { "id": "claude-haiku-3-5-20241022", "name": "Claude Haiku 3.5", "description": "Fastest" }
+  "providers": [
+    { "id": "anthropic", "name": "Anthropic (Claude)", "description": "Claude models — default provider" },
+    { "id": "openai", "name": "OpenAI-compatible", "description": "OpenAI, Azure OpenAI, or any compatible API" },
+    { "id": "custom", "name": "Custom endpoint", "description": "Any HTTP endpoint that accepts JSON POST" }
   ],
-  "default": "claude-sonnet-4-20250514"
+  "models": [
+    { "id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "provider": "anthropic" },
+    { "id": "gpt-4o", "name": "GPT-4o", "provider": "openai" }
+  ],
+  "default_provider": "anthropic",
+  "default_model": "claude-sonnet-4-20250514"
+}
+```
+
+## Providers
+
+| Provider | API Key | Endpoint | Use Case |
+|----------|---------|----------|----------|
+| `anthropic` (default) | Anthropic key (`sk-ant-...`) | Built-in | Claude models |
+| `openai` | OpenAI key (`sk-...`) | `https://api.openai.com/v1` or custom | GPT models, Azure, local LLMs (Ollama, LM Studio) |
+| `custom` | Any token | Your server URL | Your own backend, ML models, fine-tuned models |
+
+### Custom endpoint contract
+
+When using `"provider": "custom"`, WellnessMCP POSTs to your endpoint:
+
+```json
+{
+  "message": "How's my sleep?",
+  "health_context": "=== HEALTH DATA CONTEXT ===\n--- Sleep ---\n...",
+  "system_prompt": "You are a health assistant...",
+  "instructions": "Act as a sports coach"
+}
+```
+
+Your endpoint should return:
+
+```json
+{
+  "response": "Your sleep was...",
+  "model": "my-custom-model"
 }
 ```
 
@@ -147,24 +190,49 @@ Simple health check.
 # Health check
 curl https://wellnessmcp-production.up.railway.app/health
 
-# List models
+# List providers and models
 curl https://wellnessmcp-production.up.railway.app/chat/models
 
-# Ask a question (replace API keys)
+# Ask a question with Anthropic (default)
 curl -X POST https://wellnessmcp-production.up.railway.app/chat \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-ingest-key" \
   -d '{
     "message": "How am I doing?",
-    "api_key": "sk-ant-api03-your-anthropic-key",
+    "api_key": "sk-ant-your-key",
+    "instructions": "Be brief, focus on recovery",
     "health_data": {
       "vitals": { "hrv_samples": [], "resting_heart_rate_samples": [], "spo2_samples": [] },
       "sleep": { "sessions": [] },
       "activity": { "daily_steps": [], "daily_active_energy": [], "daily_exercise_minutes": [], "workouts": [] },
       "body_composition": { "body_mass_samples": [], "body_fat_percentage_samples": [], "lean_body_mass_samples": [], "bmi_samples": [] },
       "cardio_fitness": { "vo2_max_samples": [] },
-      "fetched_at": "2026-03-28T10:00:00Z"
+      "fetched_at": "2026-03-29T10:00:00Z"
     }
+  }'
+
+# Use OpenAI instead
+curl -X POST https://wellnessmcp-production.up.railway.app/chat \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-ingest-key" \
+  -d '{
+    "message": "Summarize my week",
+    "api_key": "sk-your-openai-key",
+    "provider": "openai",
+    "model": "gpt-4o",
+    "health_data": { ... }
+  }'
+
+# Route to your own backend
+curl -X POST https://wellnessmcp-production.up.railway.app/chat \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-ingest-key" \
+  -d '{
+    "message": "Generate workout plan",
+    "api_key": "your-server-token",
+    "provider": "custom",
+    "endpoint": "https://your-server.com/api/analyze",
+    "health_data": { ... }
   }'
 ```
 

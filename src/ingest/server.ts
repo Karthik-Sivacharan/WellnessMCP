@@ -3,13 +3,16 @@
  *
  * Stateless HTTP proxy server for the WellnessMCP health chat service.
  *
+ * Provider-agnostic: routes requests to Anthropic (Claude), OpenAI, or any
+ * custom HTTP endpoint. The iOS app chooses the provider per-request.
+ *
  * Architecture:
  *   AthletiqX (iOS) --POST /chat--> WellnessServer
  *     1. Authenticate request (X-API-Key header)
- *     2. Validate payload (Zod: message + health_data + api_key)
+ *     2. Validate payload (Zod: message + health_data + api_key + provider)
  *     3. Redact PII from health_data via PrivacyLayer
  *     4. Build health context text from redacted data (HealthContextBuilder)
- *     5. Call Claude API via ChatService with user's own API key
+ *     5. Route to chosen LLM provider (Anthropic / OpenAI / custom endpoint)
  *     6. Return AI response
  *
  * This server is completely stateless — no database, no storage. All health
@@ -32,8 +35,8 @@ import { z } from "zod";
 import { HealthSnapshotSchema } from "./types.js";
 import { PrivacyLayer } from "../privacy/index.js";
 import { HealthContextBuilder } from "../chat/context.js";
-import { ChatService, SUPPORTED_MODELS } from "../chat/service.js";
-import type { ChatOptions } from "../chat/service.js";
+import { ChatService, SUPPORTED_MODELS, SUPPORTED_PROVIDERS } from "../chat/service.js";
+import type { ChatOptions, LLMProvider } from "../chat/service.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -60,6 +63,12 @@ const MAX_BODY_SIZE = 5 * 1024 * 1024;
  *   - model: (optional) Override the default Claude model
  *   - days: (optional) Unused in stateless mode but kept for API compatibility
  */
+/**
+ * Zod schema for validating POST /chat request bodies.
+ *
+ * The iOS app sends health data + a question, and the server routes it
+ * to the chosen LLM provider (Anthropic, OpenAI, or a custom endpoint).
+ */
 const ChatRequestSchema = z.object({
   /** The user's question about their health */
   message: z.string().min(1, "Message is required").max(10000, "Message too long (max 10,000 chars)"),
@@ -67,14 +76,32 @@ const ChatRequestSchema = z.object({
   /** Health data from the iOS app — the full HealthSnapshot */
   health_data: HealthSnapshotSchema,
 
-  /** User's Anthropic API key for Claude */
-  api_key: z.string().min(1, "Anthropic API key is required"),
+  /** API key for the chosen LLM provider (Anthropic, OpenAI, or custom) */
+  api_key: z.string().min(1, "API key is required"),
 
-  /** Optional: override the default Claude model */
+  /** LLM provider to use: "anthropic" (default), "openai", or "custom" */
+  provider: z.enum(["anthropic", "openai", "custom"]).optional(),
+
+  /** Model identifier — provider-specific (e.g., "claude-sonnet-4-20250514", "gpt-4o") */
   model: z.string().optional(),
 
-  /** Optional: hint for context window (kept for API compat, not used in stateless mode) */
-  days: z.number().int().min(1).max(365).optional(),
+  /**
+   * Custom instructions to prepend to the system prompt.
+   * Use this to control the LLM's behavior per-request:
+   *   - "Act as a sports performance coach"
+   *   - "Give a brief 2-sentence answer"
+   *   - "Generate a morning health briefing"
+   *   - "Compare this week vs last week"
+   *   - "Focus on recovery and sleep quality"
+   */
+  instructions: z.string().max(5000).optional(),
+
+  /**
+   * Custom endpoint URL for "openai" or "custom" providers.
+   * For "openai": the base URL (e.g., "https://api.openai.com/v1")
+   * For "custom": the full URL to POST to (e.g., "https://your-server.com/api/analyze")
+   */
+  endpoint: z.string().url().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -304,23 +331,26 @@ export class IngestServer {
           return;
         }
 
-        const { message, health_data, api_key, model } = validation.data;
+        const { message, health_data, api_key, provider, model, instructions, endpoint } = validation.data;
 
         // Step 3: Apply PII redaction to the health data.
         // The PIIRedactor strips any personally identifiable information
-        // (names, emails, GPS coords, etc.) before data reaches the LLM.
+        // (names, emails, GPS coords, etc.) before data reaches any LLM.
         const { data: redactedHealthData, fieldsRedacted } = this.privacy.redactor.redact(health_data);
         const wasRedacted = fieldsRedacted.length > 0;
 
         // Step 4: Build health context text from the redacted snapshot.
         // This formats the HealthSnapshot into a structured text summary
-        // that gets injected into Claude's system prompt.
+        // that gets injected into the LLM's system prompt.
         const healthContext = this.contextBuilder.buildContext(redactedHealthData);
 
-        // Step 5: Call the chat service with the pre-built context
+        // Step 5: Call the chat service with the chosen provider
         try {
           const options: ChatOptions = {};
+          if (provider) options.provider = provider as LLMProvider;
           if (model) options.model = model;
+          if (instructions) options.instructions = instructions;
+          if (endpoint) options.endpoint = endpoint;
 
           const result = await this.chatService.chat(
             message,
@@ -333,18 +363,19 @@ export class IngestServer {
           this.sendJson(res, 200, {
             response: result.response,
             model: result.model,
+            provider: result.provider,
             was_redacted: wasRedacted,
           });
         } catch (err: unknown) {
           // Map ChatService errors to HTTP status codes
           const errMsg = err instanceof Error ? err.message : String(err);
 
-          if (errMsg.includes("Invalid Anthropic API key")) {
+          if (errMsg.includes("Invalid API key") || errMsg.includes("auth")) {
             this.sendJson(res, 401, {
-              error: "Invalid Anthropic API key",
+              error: "Invalid API key",
               message: errMsg,
             });
-          } else if (errMsg.includes("rate limit")) {
+          } else if (errMsg.includes("rate limit") || errMsg.includes("Rate limit")) {
             this.sendJson(res, 429, {
               error: "Rate limited",
               message: errMsg,
@@ -381,8 +412,10 @@ export class IngestServer {
    */
   private handleListModels(_req: http.IncomingMessage, res: http.ServerResponse): void {
     this.sendJson(res, 200, {
+      providers: SUPPORTED_PROVIDERS,
       models: SUPPORTED_MODELS,
-      default: "claude-sonnet-4-20250514",
+      default_provider: "anthropic",
+      default_model: "claude-sonnet-4-20250514",
     });
   }
 

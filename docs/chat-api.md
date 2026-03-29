@@ -1,20 +1,21 @@
 # Chat API Reference
 
-WellnessMCP's `/chat` endpoint is a stateless proxy that connects iOS health data to Claude. The iOS app sends HealthKit data + a question, the server redacts PII, builds context, calls Claude, and returns the response.
+WellnessMCP's `/chat` endpoint is a stateless, provider-agnostic proxy. The iOS app sends HealthKit data + a question, the server redacts PII, builds context, routes to the chosen LLM provider, and returns the response.
 
 ## Flow
 
 ```
-iOS App                        WellnessMCP                       Claude API
+iOS App                        WellnessMCP                       Any LLM
   │                               │                                 │
   │  POST /chat                   │                                 │
   │  { message,                   │                                 │
   │    health_data,          ───→ │  1. Validate (Zod)              │
-  │    api_key }                  │  2. Redact PII                  │
-  │                               │  3. Build context text          │
-  │                               │  4. System prompt + message ──→ │
+  │    api_key,                   │  2. Redact PII                  │
+  │    provider,                  │  3. Build context text          │
+  │    instructions }             │  4. Apply custom instructions   │
+  │                               │  5. Route to provider ────────→ │
   │                               │                            ←── │ Response
-  │                          ←── │  5. Return { response }         │
+  │                          ←── │  6. Return { response }         │
   │                               │                                 │
   │  Server forgets everything.   │  Nothing stored.                │
 ```
@@ -33,17 +34,23 @@ X-API-Key: <ingest-api-key>  (if WELLNESS_MCP_INGEST_KEY is configured)
 {
   "message": "How has my recovery been this week?",
   "api_key": "sk-ant-api03-...",
-  "health_data": { ... },
-  "model": "claude-sonnet-4-20250514"
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-20250514",
+  "instructions": "Act as a sports performance coach. Be concise.",
+  "endpoint": null,
+  "health_data": { ... }
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `message` | string | Yes | The user's health question (1-10,000 chars) |
-| `api_key` | string | Yes | User's Anthropic API key for Claude |
+| `api_key` | string | Yes | API key for the chosen LLM provider |
 | `health_data` | object | Yes | Full HealthSnapshot from the iOS app |
-| `model` | string | No | Claude model override (default: `claude-sonnet-4-20250514`) |
+| `provider` | string | No | `"anthropic"` (default), `"openai"`, or `"custom"` |
+| `model` | string | No | Model override (provider-specific) |
+| `instructions` | string | No | Custom instructions prepended to system prompt (max 5,000 chars) |
+| `endpoint` | string | No | Custom URL for `"openai"` or `"custom"` providers |
 
 ### Response (200)
 
@@ -51,6 +58,7 @@ X-API-Key: <ingest-api-key>  (if WELLNESS_MCP_INGEST_KEY is configured)
 {
   "response": "Based on your data, your recovery looks good...",
   "model": "claude-sonnet-4-20250514",
+  "provider": "anthropic",
   "was_redacted": false
 }
 ```
