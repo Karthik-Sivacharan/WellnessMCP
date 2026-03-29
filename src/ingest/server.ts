@@ -21,9 +21,13 @@
  * Endpoints:
  *   - POST /ingest/health       — Receive and store a HealthSnapshot
  *   - GET  /ingest/health/status — Check server status and record counts
+ *   - POST /chat                — Send a question, get an AI response using health data context
+ *   - POST /chat/api-key        — Store an Anthropic API key server-side for convenience
+ *   - GET  /chat/models         — List available Claude models
  */
 
 import http from "node:http";
+import { z } from "zod";
 import { HealthSnapshotSchema } from "./types.js";
 import type { HealthSnapshot } from "./types.js";
 import {
@@ -33,6 +37,10 @@ import {
   normalizeBodyComposition,
 } from "./normalizer.js";
 import { StorageManager } from "../storage/db.js";
+import { PrivacyLayer } from "../privacy/index.js";
+import { HealthContextBuilder } from "../chat/context.js";
+import { ChatService, SUPPORTED_MODELS } from "../chat/service.js";
+import type { ChatOptions } from "../chat/service.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -77,8 +85,19 @@ interface IngestStatus {
 export class IngestServer {
   private server: http.Server | null = null;
   private storage: StorageManager;
+  private privacy: PrivacyLayer;
   private port: number;
   private apiKey: string | null;
+
+  /** The chat service handles question -> context -> LLM -> response */
+  private chatService: ChatService;
+
+  /**
+   * In-memory store for user API keys, keyed by user_id.
+   * This allows the iOS app to store the key once and omit it from
+   * subsequent /chat requests. Keys are lost on server restart.
+   */
+  private storedApiKeys: Map<string, string> = new Map();
 
   /** Tracks status information for the /status endpoint */
   private status: IngestStatus = {
@@ -93,13 +112,21 @@ export class IngestServer {
    * Creates a new IngestServer instance.
    *
    * @param storage - The StorageManager instance for persisting normalized data
+   * @param privacy - The PrivacyLayer instance for consent/redaction/aggregation
    * @param port - Port to listen on (defaults to WELLNESS_MCP_INGEST_PORT env var or 3456)
    * @param apiKey - Optional API key for authenticating requests (defaults to WELLNESS_MCP_INGEST_KEY env var)
    */
-  constructor(storage: StorageManager, port?: number, apiKey?: string) {
+  constructor(storage: StorageManager, privacy: PrivacyLayer, port?: number, apiKey?: string) {
     this.storage = storage;
+    this.privacy = privacy;
     this.port = port ?? parseInt(process.env.WELLNESS_MCP_INGEST_PORT ?? String(DEFAULT_PORT), 10);
     this.apiKey = apiKey ?? process.env.WELLNESS_MCP_INGEST_KEY ?? null;
+
+    // Initialize the chat service pipeline:
+    //   HealthContextBuilder (queries SQLite + applies privacy filtering)
+    //   -> ChatService (constructs prompt + calls Claude API)
+    const contextBuilder = new HealthContextBuilder(storage, privacy);
+    this.chatService = new ChatService(contextBuilder);
   }
 
   /**
@@ -222,6 +249,24 @@ export class IngestServer {
     // Route: GET /ingest/health/status — check server status
     if (req.method === "GET" && url === "/ingest/health/status") {
       this.handleStatus(req, res);
+      return;
+    }
+
+    // Route: POST /chat — process a health question through the LLM
+    if (req.method === "POST" && url === "/chat") {
+      this.handleChat(req, res);
+      return;
+    }
+
+    // Route: POST /chat/api-key — store an Anthropic API key server-side
+    if (req.method === "POST" && url === "/chat/api-key") {
+      this.handleStoreApiKey(req, res);
+      return;
+    }
+
+    // Route: GET /chat/models — list available Claude models
+    if (req.method === "GET" && url === "/chat/models") {
+      this.handleListModels(req, res);
       return;
     }
 
@@ -349,6 +394,258 @@ export class IngestServer {
           }
         : null,
       data_inventory: inventory,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Chat endpoint handlers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Zod schema for validating POST /chat request bodies.
+   * - message: Required question from the user
+   * - api_key: Anthropic API key (optional if previously stored via /chat/api-key)
+   * - user_id: Used to look up a stored API key (optional)
+   * - model: Override the default Claude model (optional)
+   * - days: Override the health context time window (optional)
+   */
+  private static ChatRequestSchema = z.object({
+    message: z.string().min(1, "Message is required").max(10000, "Message too long (max 10,000 chars)"),
+    api_key: z.string().optional(),
+    user_id: z.string().optional(),
+    model: z.string().optional(),
+    days: z.number().int().min(1).max(365).optional(),
+  });
+
+  /**
+   * Zod schema for validating POST /chat/api-key request bodies.
+   * - api_key: The Anthropic API key to store
+   * - user_id: Identifier for the user (defaults to "default")
+   */
+  private static StoreApiKeySchema = z.object({
+    api_key: z.string().min(1, "API key is required"),
+    user_id: z.string().optional(),
+  });
+
+  /**
+   * Handles POST /chat requests.
+   *
+   * Processing pipeline:
+   *   1. Authenticate request (if ingest API key is configured)
+   *   2. Parse and validate JSON body with Zod
+   *   3. Resolve the Anthropic API key (from request body or stored keys)
+   *   4. Call ChatService.chat() which builds context, calls Claude, returns response
+   *   5. Return the AI response to the client
+   *
+   * Error mapping:
+   *   - 400: Invalid JSON or missing required fields
+   *   - 401: Missing/invalid ingest API key OR invalid Anthropic API key
+   *   - 422: Zod validation failure (detailed field errors)
+   *   - 429: Anthropic API rate limit exceeded
+   *   - 500: Unexpected server error
+   */
+  private handleChat(req: http.IncomingMessage, res: http.ServerResponse): void {
+    // Step 1: Authenticate the request against the ingest API key.
+    // This protects the endpoint itself. The user's Anthropic API key is
+    // separate and only used for the Claude API call.
+    if (!this.authenticateRequest(req)) {
+      this.sendJson(res, 401, {
+        error: "Unauthorized",
+        message: "Missing or invalid API key. Set the X-API-Key header or Authorization: Bearer <key>.",
+      });
+      return;
+    }
+
+    // Step 2: Read and parse the request body
+    this.readBody(req)
+      .then(async (body) => {
+        // Parse JSON
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          this.sendJson(res, 400, {
+            error: "Invalid JSON",
+            message: "Request body is not valid JSON.",
+          });
+          return;
+        }
+
+        // Validate with Zod
+        const validation = IngestServer.ChatRequestSchema.safeParse(parsed);
+        if (!validation.success) {
+          this.sendJson(res, 422, {
+            error: "Validation failed",
+            message: "The request does not match the expected format.",
+            details: validation.error.issues.map((issue) => ({
+              path: issue.path.join("."),
+              message: issue.message,
+            })),
+          });
+          return;
+        }
+
+        const { message, api_key, user_id, model, days } = validation.data;
+
+        // Step 3: Resolve the Anthropic API key.
+        // Priority: request body > stored key > environment variable
+        const resolvedApiKey =
+          api_key ??
+          (user_id ? this.storedApiKeys.get(user_id) : undefined) ??
+          this.storedApiKeys.get("default") ??
+          process.env.ANTHROPIC_API_KEY;
+
+        if (!resolvedApiKey) {
+          this.sendJson(res, 400, {
+            error: "Missing API key",
+            message:
+              "No Anthropic API key provided. Either include 'api_key' in the request body, " +
+              "store one via POST /chat/api-key, or set the ANTHROPIC_API_KEY environment variable.",
+          });
+          return;
+        }
+
+        // Step 4: Call the chat service
+        try {
+          const options: ChatOptions = {};
+          if (model) options.model = model;
+          if (days) options.days = days;
+
+          const result = await this.chatService.chat(message, resolvedApiKey, options);
+
+          // Step 5: Return the response
+          this.sendJson(res, 200, {
+            response: result.response,
+            model: result.model,
+            context_days: result.contextDays,
+          });
+        } catch (err: unknown) {
+          // Map ChatService errors to HTTP status codes
+          const errMsg = err instanceof Error ? err.message : String(err);
+
+          if (errMsg.includes("Invalid Anthropic API key")) {
+            this.sendJson(res, 401, {
+              error: "Invalid Anthropic API key",
+              message: errMsg,
+            });
+          } else if (errMsg.includes("rate limit")) {
+            this.sendJson(res, 429, {
+              error: "Rate limited",
+              message: errMsg,
+            });
+          } else {
+            console.error("[IngestServer] Chat error:", errMsg);
+            this.sendJson(res, 500, {
+              error: "Chat failed",
+              message: errMsg,
+            });
+          }
+        }
+      })
+      .catch((err) => {
+        if (err instanceof Error && err.message === "BODY_TOO_LARGE") {
+          this.sendJson(res, 413, {
+            error: "Payload too large",
+            message: `Request body exceeds the ${MAX_BODY_SIZE / 1024 / 1024}MB limit.`,
+          });
+        } else {
+          this.sendJson(res, 500, {
+            error: "Internal server error",
+            message: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
+  }
+
+  /**
+   * Handles POST /chat/api-key requests.
+   *
+   * Stores an Anthropic API key in memory so subsequent /chat requests
+   * can omit it. Keys are stored in a simple Map keyed by user_id.
+   *
+   * This is a convenience feature for the iOS app — it can store the key
+   * once after the user enters it, then all future chat requests automatically
+   * use the stored key.
+   *
+   * NOTE: Keys are stored in memory only and are lost on server restart.
+   * For persistent storage, the iOS app should store the key in its own
+   * Keychain and send it with each request.
+   */
+  private handleStoreApiKey(req: http.IncomingMessage, res: http.ServerResponse): void {
+    // Authenticate against the ingest API key
+    if (!this.authenticateRequest(req)) {
+      this.sendJson(res, 401, {
+        error: "Unauthorized",
+        message: "Missing or invalid API key. Set the X-API-Key header or Authorization: Bearer <key>.",
+      });
+      return;
+    }
+
+    this.readBody(req)
+      .then((body) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          this.sendJson(res, 400, {
+            error: "Invalid JSON",
+            message: "Request body is not valid JSON.",
+          });
+          return;
+        }
+
+        const validation = IngestServer.StoreApiKeySchema.safeParse(parsed);
+        if (!validation.success) {
+          this.sendJson(res, 422, {
+            error: "Validation failed",
+            message: "The request does not match the expected format.",
+            details: validation.error.issues.map((issue) => ({
+              path: issue.path.join("."),
+              message: issue.message,
+            })),
+          });
+          return;
+        }
+
+        const { api_key, user_id } = validation.data;
+        const effectiveUserId = user_id ?? "default";
+
+        // Store the key in the in-memory map
+        this.storedApiKeys.set(effectiveUserId, api_key);
+
+        console.error(`[IngestServer] Stored API key for user: ${effectiveUserId}`);
+
+        this.sendJson(res, 200, {
+          success: true,
+          message: "API key stored successfully. It will be used for subsequent /chat requests.",
+          user_id: effectiveUserId,
+        });
+      })
+      .catch((err) => {
+        if (err instanceof Error && err.message === "BODY_TOO_LARGE") {
+          this.sendJson(res, 413, {
+            error: "Payload too large",
+            message: `Request body exceeds the ${MAX_BODY_SIZE / 1024 / 1024}MB limit.`,
+          });
+        } else {
+          this.sendJson(res, 500, {
+            error: "Internal server error",
+            message: err instanceof Error ? err.message : "Unknown error",
+          });
+        }
+      });
+  }
+
+  /**
+   * Handles GET /chat/models requests.
+   *
+   * Returns the list of supported Claude models with their descriptions.
+   * No authentication required — this is public information.
+   */
+  private handleListModels(_req: http.IncomingMessage, res: http.ServerResponse): void {
+    this.sendJson(res, 200, {
+      models: SUPPORTED_MODELS,
+      default: "claude-sonnet-4-20250514",
     });
   }
 

@@ -51,7 +51,7 @@ async function main(): Promise<void> {
   // iOS app POSTs HealthKit data to an HTTP ingest endpoint. We start the
   // ingest server automatically so data can flow in as soon as the MCP
   // server is running.
-  const appleHealth = new AppleHealthProvider(storage);
+  const appleHealth = new AppleHealthProvider(storage, privacy);
   providers.register(appleHealth);
 
   try {

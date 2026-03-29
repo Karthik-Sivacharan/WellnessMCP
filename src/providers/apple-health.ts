@@ -23,6 +23,7 @@
 import { HealthProvider } from "./base.js";
 import type { SyncResult, ProviderName } from "./types.js";
 import { StorageManager } from "../storage/db.js";
+import type { PrivacyLayer } from "../privacy/index.js";
 import { IngestServer } from "../ingest/server.js";
 
 /**
@@ -43,8 +44,12 @@ export class AppleHealthProvider extends HealthProvider {
   /** The HTTP ingest server instance, created on connect() */
   private ingestServer: IngestServer | null = null;
 
-  constructor(storage: StorageManager) {
+  /** Privacy layer passed through to the IngestServer for chat context filtering */
+  private privacy: PrivacyLayer;
+
+  constructor(storage: StorageManager, privacy: PrivacyLayer) {
     super(storage);
+    this.privacy = privacy;
   }
 
   /**
@@ -75,8 +80,9 @@ export class AppleHealthProvider extends HealthProvider {
     const port = config?.port ? parseInt(config.port, 10) : undefined;
     const apiKey = config?.api_key;
 
-    // Create and start the ingest server
-    this.ingestServer = new IngestServer(this.storage, port, apiKey);
+    // Create and start the ingest server, passing the privacy layer so the
+    // chat endpoints can apply consent/redaction before sending data to the LLM
+    this.ingestServer = new IngestServer(this.storage, this.privacy, port, apiKey);
     await this.ingestServer.start();
 
     // Register the device in the storage layer so MCP tools can see it
@@ -155,7 +161,7 @@ export class AppleHealthProvider extends HealthProvider {
       return;
     }
 
-    this.ingestServer = new IngestServer(this.storage, port, apiKey);
+    this.ingestServer = new IngestServer(this.storage, this.privacy, port, apiKey);
     await this.ingestServer.start();
   }
 
