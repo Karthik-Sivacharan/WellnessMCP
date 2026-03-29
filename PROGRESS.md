@@ -65,12 +65,30 @@ Local-first, privacy-first health data MCP server. Your health data never leaves
 - `get_trends` — Trend analysis with direction, change %, and stats
 - `get_correlations` — Pearson correlation between any two metrics
 
+### Phase 5 — Provider Implementations (partial)
+
+**Apple Health (src/providers/apple-health.ts + src/ingest/)**
+- **AppleHealthProvider** — Push-based HealthProvider implementation; starts HTTP ingest server on connect()
+- **IngestServer** (src/ingest/server.ts) — Node.js `http` server (no Express) on configurable port (default 3456)
+  - `POST /ingest/health` — Accepts HealthSnapshot JSON from AthletiqX iOS app
+  - `GET /ingest/health/status` — Returns connection status, last sync time, record counts
+  - API key auth via `X-API-Key` or `Authorization: Bearer` headers (optional, env `WELLNESS_MCP_INGEST_KEY`)
+  - CORS headers, 5MB request size limit, Zod validation, meaningful error responses
+- **HealthSnapshot types** (src/ingest/types.ts) — Zod schemas + TypeScript interfaces for all 13 HealthKit data types
+- **Normalizer** (src/ingest/normalizer.ts) — Transforms HealthSnapshot → WellnessMCP normalized types:
+  - Sleep: seconds→minutes, efficiency calculation, stage mapping (core→light)
+  - Activity: daily aggregation by date, individual workouts with HKWorkoutActivityType mapping (70+ types)
+  - Vitals: HRV (ms), resting HR (bpm), SpO2 (fraction→percentage)
+  - Body composition: group by date, body fat fraction→percentage, lean mass→muscle_mass_kg
+  - VO2 Max merged into daily activity summaries
+- **Auto-start** — Ingest server starts automatically on WellnessMCP startup, graceful shutdown on SIGINT
+- **Documentation** — docs/apple-health-integration.md with architecture, setup, payload format, curl examples, troubleshooting
+
 ---
 
 ## Up Next
 
-### Phase 5 — Provider Implementations
-- [ ] **Apple Health** — Parse exported XML/ZIP, map to normalized types
+### Phase 5 — Provider Implementations (remaining)
 - [ ] **Oura Ring** — OAuth connect, REST API sync (sleep, activity, readiness)
 - [ ] **WHOOP** — OAuth connect, REST API sync (sleep, strain, recovery)
 - [ ] **Garmin Connect** — OAuth connect, REST API sync (activities, sleep, body)
