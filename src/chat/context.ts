@@ -19,7 +19,21 @@
  * BEFORE passing it to buildContext().
  */
 
-import type { HealthSnapshot, DatedValue, SleepSession, WorkoutSummary } from "../ingest/types.js";
+import type {
+  HealthSnapshot,
+  DatedValue,
+  SleepSession,
+  WorkoutSummary,
+  NutritionData,
+  HeartData,
+  RespiratoryData,
+  MindfulnessData,
+  MobilityData,
+  ReproductiveData,
+  EnvironmentalData,
+  ClinicalData,
+  OtherMetricsData,
+} from "../ingest/types.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -241,6 +255,35 @@ export class HealthContextBuilder {
     sections.push(this.buildVitalsSection(snapshot));
     sections.push(this.buildBodyCompositionSection(snapshot));
     sections.push(this.buildCardioFitnessSection(snapshot));
+
+    // Extended HealthKit categories — only included if the snapshot contains them
+    if (snapshot.nutrition) {
+      sections.push(this.buildNutritionSection(snapshot.nutrition));
+    }
+    if (snapshot.heart) {
+      sections.push(this.buildHeartSection(snapshot.heart));
+    }
+    if (snapshot.respiratory) {
+      sections.push(this.buildRespiratorySection(snapshot.respiratory));
+    }
+    if (snapshot.mindfulness) {
+      sections.push(this.buildMindfulnessSection(snapshot.mindfulness));
+    }
+    if (snapshot.mobility) {
+      sections.push(this.buildMobilitySection(snapshot.mobility));
+    }
+    if (snapshot.reproductive) {
+      sections.push(this.buildReproductiveSection(snapshot.reproductive));
+    }
+    if (snapshot.environmental) {
+      sections.push(this.buildEnvironmentalSection(snapshot.environmental));
+    }
+    if (snapshot.clinical) {
+      sections.push(this.buildClinicalSection(snapshot.clinical));
+    }
+    if (snapshot.other_metrics) {
+      sections.push(this.buildOtherMetricsSection(snapshot.other_metrics));
+    }
 
     return sections.join("\n\n");
   }
@@ -510,6 +553,291 @@ export class HealthContextBuilder {
     lines.push(`  Avg: ${avg} mL/kg/min | Trend: ${trend}`);
 
     return lines.join("\n");
+  }
+
+  // -------------------------------------------------------------------------
+  // Extended HealthKit category section builders
+  // -------------------------------------------------------------------------
+
+  /**
+   * Builds the nutrition data section.
+   *
+   * Shows macro breakdown (calories, protein, carbs, fat), hydration,
+   * and micronutrients with daily totals and averages.
+   *
+   * @param nutrition - NutritionData from the HealthSnapshot
+   * @returns Formatted nutrition section string
+   */
+  private buildNutritionSection(nutrition: NutritionData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["Calories", nutrition.dietary_energy_consumed, "kcal"],
+      ["Protein", nutrition.dietary_protein, "g"],
+      ["Carbs", nutrition.dietary_carbohydrates, "g"],
+      ["Total Fat", nutrition.dietary_fat_total, "g"],
+      ["Fiber", nutrition.dietary_fiber, "g"],
+      ["Sugar", nutrition.dietary_sugar, "g"],
+      ["Water", nutrition.dietary_water, "mL"],
+      ["Caffeine", nutrition.dietary_caffeine, "mg"],
+      ["Sodium", nutrition.dietary_sodium, "mg"],
+      ["Cholesterol", nutrition.dietary_cholesterol, "mg"],
+      ["Iron", nutrition.dietary_iron, "mg"],
+      ["Calcium", nutrition.dietary_calcium, "mg"],
+      ["Potassium", nutrition.dietary_potassium, "mg"],
+      ["Vitamin A", nutrition.dietary_vitamin_a, "mcg"],
+      ["Vitamin C", nutrition.dietary_vitamin_c, "mg"],
+      ["Vitamin D", nutrition.dietary_vitamin_d, "mcg"],
+      ["Vitamin B6", nutrition.dietary_vitamin_b6, "mg"],
+      ["Vitamin B12", nutrition.dietary_vitamin_b12, "mcg"],
+      ["Folate", nutrition.dietary_folate, "mcg"],
+      ["Magnesium", nutrition.dietary_magnesium, "mg"],
+      ["Zinc", nutrition.dietary_zinc, "mg"],
+      ["Saturated Fat", nutrition.dietary_fat_saturated, "g"],
+      ["Monounsaturated Fat", nutrition.dietary_fat_monounsaturated, "g"],
+      ["Polyunsaturated Fat", nutrition.dietary_fat_polyunsaturated, "g"],
+    ];
+
+    return this.buildGenericSection("Nutrition", fieldMap);
+  }
+
+  /**
+   * Builds the extended heart data section.
+   *
+   * Shows continuous heart rate, walking average, recovery, and AFib burden.
+   *
+   * @param heart - HeartData from the HealthSnapshot
+   * @returns Formatted heart section string
+   */
+  private buildHeartSection(heart: HeartData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["Heart Rate", heart.heart_rate, "bpm"],
+      ["Walking HR Avg", heart.walking_heart_rate_average, "bpm"],
+      ["HR Recovery (1min)", heart.heart_rate_recovery, "bpm"],
+      ["AFib Burden", heart.atrialFibrillationBurden, "%"],
+    ];
+
+    return this.buildGenericSection("Heart (Extended)", fieldMap);
+  }
+
+  /**
+   * Builds the respiratory data section.
+   *
+   * Shows breathing rate, lung function metrics, and inhaler usage.
+   *
+   * @param respiratory - RespiratoryData from the HealthSnapshot
+   * @returns Formatted respiratory section string
+   */
+  private buildRespiratorySection(respiratory: RespiratoryData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["Respiratory Rate", respiratory.respiratory_rate, "breaths/min"],
+      ["Forced Vital Capacity", respiratory.forced_vital_capacity, "L"],
+      ["FEV1", respiratory.forced_expiratory_volume, "L"],
+      ["Peak Expiratory Flow", respiratory.peak_expiratory_flow_rate, "L/min"],
+      ["Inhaler Usage", respiratory.inhaler_usage, "uses"],
+    ];
+
+    return this.buildGenericSection("Respiratory", fieldMap);
+  }
+
+  /**
+   * Builds the mindfulness and mental health section.
+   *
+   * Shows meditation sessions, mood/state of mind, and daylight exposure.
+   *
+   * @param mindfulness - MindfulnessData from the HealthSnapshot
+   * @returns Formatted mindfulness section string
+   */
+  private buildMindfulnessSection(mindfulness: MindfulnessData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["Mindful Sessions", mindfulness.mindful_sessions, "min"],
+      ["State of Mind", mindfulness.state_of_mind, "/5"],
+      ["Time in Daylight", mindfulness.time_in_daylight, "min"],
+    ];
+
+    return this.buildGenericSection("Mindfulness & Mental Health", fieldMap);
+  }
+
+  /**
+   * Builds the mobility data section.
+   *
+   * Shows gait analysis metrics, stair speed, and six-minute walk distance.
+   *
+   * @param mobility - MobilityData from the HealthSnapshot
+   * @returns Formatted mobility section string
+   */
+  private buildMobilitySection(mobility: MobilityData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["Walking Speed", mobility.walking_speed, "m/s"],
+      ["Step Length", mobility.walking_step_length, "m"],
+      ["Walking Asymmetry", mobility.walking_asymmetry, "%"],
+      ["Double Support", mobility.walking_double_support, "%"],
+      ["Stair Ascent Speed", mobility.stair_ascent_speed, "m/s"],
+      ["Stair Descent Speed", mobility.stair_descent_speed, "m/s"],
+      ["6-Min Walk Distance", mobility.six_minute_walk_distance, "m"],
+    ];
+
+    return this.buildGenericSection("Mobility", fieldMap);
+  }
+
+  /**
+   * Builds the reproductive health section.
+   *
+   * Shows menstrual cycle data, fertility indicators, and basal temperature.
+   *
+   * @param reproductive - ReproductiveData from the HealthSnapshot
+   * @returns Formatted reproductive health section string
+   */
+  private buildReproductiveSection(reproductive: ReproductiveData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["Menstrual Flow", reproductive.menstrual_flow, "level"],
+      ["Cervical Mucus", reproductive.cervical_mucus_quality, "quality"],
+      ["Basal Body Temp", reproductive.basal_body_temperature, "\u00B0C"],
+      ["Ovulation Test", reproductive.ovulation_test_result, "result"],
+      ["Sexual Activity", reproductive.sexual_activity, ""],
+      ["Intermenstrual Bleeding", reproductive.intermenstrual_bleeding, ""],
+    ];
+
+    return this.buildGenericSection("Reproductive Health", fieldMap);
+  }
+
+  /**
+   * Builds the environmental exposure section.
+   *
+   * Shows UV index, noise levels, headphone audio exposure, and water temperature.
+   *
+   * @param environmental - EnvironmentalData from the HealthSnapshot
+   * @returns Formatted environmental section string
+   */
+  private buildEnvironmentalSection(environmental: EnvironmentalData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["UV Exposure", environmental.uv_exposure, "UV index"],
+      ["Environmental Audio", environmental.environmental_audio_exposure, "dB"],
+      ["Headphone Audio", environmental.headphone_audio_exposure, "dB"],
+      ["Water Temperature", environmental.water_temperature, "\u00B0C"],
+    ];
+
+    return this.buildGenericSection("Environmental", fieldMap);
+  }
+
+  /**
+   * Builds the clinical and lab data section.
+   *
+   * Shows blood glucose, blood pressure, body temperature, insulin delivery,
+   * and other medical metrics.
+   *
+   * @param clinical - ClinicalData from the HealthSnapshot
+   * @returns Formatted clinical section string
+   */
+  private buildClinicalSection(clinical: ClinicalData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["Blood Glucose", clinical.blood_glucose, "mg/dL"],
+      ["BP Systolic", clinical.blood_pressure_systolic, "mmHg"],
+      ["BP Diastolic", clinical.blood_pressure_diastolic, "mmHg"],
+      ["Blood Alcohol", clinical.blood_alcohol_content, "%"],
+      ["Insulin Delivery", clinical.insulin_delivery, "IU"],
+      ["Falls", clinical.number_of_times_fallen, "count"],
+      ["Electrodermal Activity", clinical.electrodermal_activity, "\u00B5S"],
+      ["Perfusion Index", clinical.peripheral_perfusion_index, "%"],
+      ["Body Temperature", clinical.body_temperature, "\u00B0C"],
+      ["Sleeping Wrist Temp", clinical.apple_sleeping_wrist_temperature, "\u00B0C delta"],
+    ];
+
+    return this.buildGenericSection("Clinical & Lab", fieldMap);
+  }
+
+  /**
+   * Builds the other metrics section.
+   *
+   * Shows flights climbed, running dynamics, cycling metrics, swimming,
+   * wheelchair, and other miscellaneous fitness data.
+   *
+   * @param metrics - OtherMetricsData from the HealthSnapshot
+   * @returns Formatted other metrics section string
+   */
+  private buildOtherMetricsSection(metrics: OtherMetricsData): string {
+    const fieldMap: Array<[string, DatedValue[], string]> = [
+      ["Flights Climbed", metrics.flights_climbed, "flights"],
+      ["Nike Fuel", metrics.nike_fuel, "pts"],
+      ["Stand Time", metrics.apple_stand_time, "min"],
+      ["Move Time", metrics.apple_move_time, "min"],
+      ["Swim Strokes", metrics.swimming_stroke_count, "strokes"],
+      ["Underwater Depth", metrics.underwater_depth, "m"],
+      ["Wheelchair Distance", metrics.distance_wheelchair, "m"],
+      ["Push Count", metrics.push_count, "pushes"],
+      ["Running Power", metrics.running_power, "W"],
+      ["Running Speed", metrics.running_speed, "m/s"],
+      ["Stride Length", metrics.running_stride_length, "m"],
+      ["Vertical Oscillation", metrics.running_vertical_oscillation, "cm"],
+      ["Ground Contact Time", metrics.running_ground_contact_time, "ms"],
+      ["Cycling Speed", metrics.cycling_speed, "m/s"],
+      ["Cycling Power", metrics.cycling_power, "W"],
+      ["Cycling Cadence", metrics.cycling_cadence, "rpm"],
+      ["Physical Effort", metrics.physical_effort, "kcal/hr/kg"],
+    ];
+
+    return this.buildGenericSection("Other Metrics", fieldMap);
+  }
+
+  /**
+   * Generic section builder for extended HealthKit categories.
+   *
+   * Takes a list of (label, samples, unit) tuples and produces a formatted
+   * section with per-sample values, averages, and trend analysis for any
+   * fields that have data. Empty fields are silently skipped.
+   *
+   * @param sectionName - The display name for the section header
+   * @param fields - Array of [label, samples, unit] tuples
+   * @returns Formatted section string
+   */
+  private buildGenericSection(
+    sectionName: string,
+    fields: Array<[string, DatedValue[], string]>,
+  ): string {
+    const hasAnyData = fields.some(([, samples]) => samples.length > 0);
+
+    if (!hasAnyData) {
+      return `--- ${sectionName} ---\nNo ${sectionName.toLowerCase()} data available.`;
+    }
+
+    const lines: string[] = [`--- ${sectionName} ---`];
+
+    for (const [label, samples, unit] of fields) {
+      if (samples.length === 0) continue;
+
+      // Show individual values
+      const values = samples.map(
+        (s) => `${toDateString(s.date)}: ${this.formatValue(s.value, unit)}`
+      );
+      lines.push(`${label}: ${values.join(", ")}`);
+
+      // Show average and trend for metrics with multiple samples
+      if (samples.length >= 2) {
+        const numericValues = samples.map((s) => s.value);
+        const avg = mean(numericValues);
+        const trend = computeTrend(numericValues);
+        lines.push(`  Avg: ${this.formatValue(avg!, unit)} | Trend: ${trend}`);
+      } else if (samples.length === 1) {
+        // Single sample — just show the value without trend
+        lines.push(`  Single reading`);
+      }
+    }
+
+    return lines.join("\n");
+  }
+
+  /**
+   * Formats a numeric value with its unit, applying appropriate rounding.
+   *
+   * @param value - The numeric value to format
+   * @param unit - The unit string to append
+   * @returns Formatted value string (e.g. "72.5 bpm", "3200 kcal")
+   */
+  private formatValue(value: number, unit: string): string {
+    // For integer-like values (counts, steps), show as whole numbers
+    const formatted = Number.isInteger(value)
+      ? value.toString()
+      : (Math.round(value * 10) / 10).toString();
+
+    return unit ? `${formatted} ${unit}` : formatted;
   }
 
   // -------------------------------------------------------------------------
