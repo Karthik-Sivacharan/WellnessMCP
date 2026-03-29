@@ -89,21 +89,36 @@ Returns available Claude models. No auth required.
 
 ## HealthSnapshot Format
 
-All keys are snake_case (matching iOS `convertToSnakeCase` encoding).
+All keys are snake_case (matching iOS `convertToSnakeCase` encoding). The schema supports 80+ fields across 14 categories. All categories except the original 5 are optional — send what you have.
+
+### Core Categories (currently sent by AthletiqX)
 
 | Field | Unit | Notes |
 |-------|------|-------|
-| `hrv_samples[].value` | ms | HRV SDNN |
-| `resting_heart_rate_samples[].value` | bpm | Resting heart rate |
-| `spo2_samples[].value` | 0-1 fraction | 0.98 = 98% SpO2 |
-| `sleep *_duration` | seconds | All sleep stage durations |
-| `daily_steps[].value` | count | Step count |
-| `daily_active_energy[].value` | kcal | Active calories |
-| `workouts[].activity_type` | integer | HKWorkoutActivityType rawValue |
-| `workouts[].duration` | seconds | Workout length |
-| `body_mass_samples[].value` | kg | Weight |
-| `body_fat_percentage_samples[].value` | 0-1 fraction | 0.18 = 18% |
-| `vo2_max_samples[].value` | mL/kg/min | VO2 Max |
+| `vitals.hrv_samples[].value` | ms | HRV SDNN |
+| `vitals.resting_heart_rate_samples[].value` | bpm | Resting heart rate |
+| `vitals.spo2_samples[].value` | 0-1 fraction | 0.98 = 98% SpO2 |
+| `sleep.sessions[]*_duration` | seconds | All sleep stage durations |
+| `activity.daily_steps[].value` | count | Step count |
+| `activity.daily_active_energy[].value` | kcal | Active calories |
+| `activity.workouts[].activity_type` | integer | HKWorkoutActivityType rawValue |
+| `body_composition.body_mass_samples[].value` | kg | Weight |
+| `body_composition.body_fat_percentage_samples[].value` | 0-1 fraction | 0.18 = 18% |
+| `cardio_fitness.vo2_max_samples[].value` | mL/kg/min | VO2 Max |
+
+### Extended Categories (optional, all `.default({})`)
+
+| Category | Key | Fields | Example Units |
+|----------|-----|--------|---------------|
+| Nutrition | `nutrition` | 24 dietary fields | kcal, grams, mg, mcg, mL |
+| Heart | `heart` | continuous HR, walking HR, recovery, AFib | bpm, % |
+| Respiratory | `respiratory` | breathing rate, FVC, FEV1, peak flow | breaths/min, L, L/min |
+| Mindfulness | `mindfulness` | mindful sessions, state of mind, daylight | min, 1-5, min |
+| Mobility | `mobility` | walking speed/asymmetry, stair speed, 6MWT | m/s, %, meters |
+| Reproductive | `reproductive` | menstrual flow, basal temp, ovulation | 1-3, °C, 0/1 |
+| Environmental | `environmental` | UV, audio exposure | UV index, dB |
+| Clinical | `clinical` | blood glucose, BP, body temp, insulin, falls | mg/dL, mmHg, °C, IU |
+| Other | `other_metrics` | flights, running/cycling dynamics, swimming | count, watts, m/s, rpm |
 
 ## Privacy
 

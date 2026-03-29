@@ -2,7 +2,7 @@
 
 Stateless, privacy-first health data proxy. Connects your iOS health data to Claude without storing anything.
 
-WellnessMCP is a lightweight HTTP server that acts as a bridge between the [AthletiqX](https://github.com/syntheticfinds/athletiqx) iOS app and Claude. The iOS app sends HealthKit data + a question, the server redacts PII, builds context, calls Claude API, and returns the response. No data is ever stored on the server.
+WellnessMCP is a lightweight HTTP server that acts as a bridge between the [AthletiqX](https://github.com/syntheticfinds/athletiqx) iOS app and Claude. The iOS app sends HealthKit data + a question, the server redacts PII, builds context, calls Claude API, and returns the response. Supports 80+ Apple HealthKit data types across 14 categories. No data is ever stored on the server.
 
 ## Architecture
 
@@ -179,9 +179,30 @@ Health data passes through a PII redactor before reaching Claude. The redactor d
 
 The server never stores any data. Health data exists only in memory for the duration of the request, then is discarded.
 
+## Supported HealthKit Data Types (80+)
+
+WellnessMCP accepts every category of data that Apple HealthKit offers. All fields are optional — send what you have.
+
+| Category | Fields | Examples |
+|----------|--------|----------|
+| **Vitals** | 3 | HRV (SDNN), resting heart rate, SpO2 |
+| **Sleep** | 5 | Sleep stages (core, deep, REM, awake), in-bed duration |
+| **Activity** | 4 + workouts | Steps, active energy, exercise minutes, 70+ workout types |
+| **Body Composition** | 4 | Weight, body fat %, lean mass, BMI |
+| **Cardio Fitness** | 1 | VO2 Max |
+| **Nutrition** | 24 | Calories, protein, carbs, fat, fiber, sugar, water, caffeine, vitamins (A/C/D/B6/B12), minerals (iron, calcium, potassium, magnesium, zinc), folate |
+| **Heart (extended)** | 4 | Continuous HR, walking HR avg, HR recovery, AFib burden |
+| **Respiratory** | 5 | Breathing rate, forced vital capacity, FEV1, peak flow, inhaler usage |
+| **Mindfulness** | 3 | Meditation minutes, state of mind, daylight exposure |
+| **Mobility** | 7 | Walking speed, step length, asymmetry, double support, stair speed, 6-min walk test |
+| **Reproductive** | 6 | Menstrual flow, basal body temp, cervical mucus, ovulation, cycle tracking |
+| **Environmental** | 4 | UV index, environmental audio, headphone audio, water temperature |
+| **Clinical / Lab** | 10 | Blood glucose, blood pressure (systolic + diastolic), body temp, wrist temp, insulin, falls, electrodermal activity, perfusion index, BAC |
+| **Other Metrics** | 17 | Flights climbed, stand/move time, swimming strokes, running dynamics (power, speed, cadence, stride, ground contact, vertical oscillation), cycling metrics, wheelchair distance |
+
 ## How It Works with AthletiqX
 
-The [AthletiqX](https://github.com/syntheticfinds/athletiqx) iOS app reads 13 HealthKit data types (HRV, resting HR, SpO2, sleep stages, steps, calories, exercise, workouts, body mass, body fat, lean mass, BMI, VO2 Max).
+The [AthletiqX](https://github.com/syntheticfinds/athletiqx) iOS app currently reads 13 HealthKit data types, with plans to expand to all supported categories.
 
 When the user asks a question in the Health Chat tab:
 

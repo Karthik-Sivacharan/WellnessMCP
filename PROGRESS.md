@@ -20,7 +20,7 @@ iOS App → POST /chat { health_data, message, api_key } → PII redact → Clau
   - `GET /chat/models` — Lists available Claude models
   - `GET /health` — Simple health check
   - Zod validation, CORS, API key auth, 5MB request limit
-- **HealthSnapshot schemas** (src/ingest/types.ts) — Zod validation for all 13 HealthKit data types
+- **HealthSnapshot schemas** (src/ingest/types.ts) — Zod validation for 80+ HealthKit data types across 14 categories (vitals, sleep, activity, body composition, cardio fitness, nutrition, heart, respiratory, mindfulness, mobility, reproductive, environmental, clinical, other metrics)
 - **Health context builder** (src/chat/context.ts) — Formats HealthSnapshot into concise text for Claude prompt
 - **Chat service** (src/chat/service.ts) — Calls Claude API via @anthropic-ai/sdk, error handling
 - **PII redactor** (src/privacy/redactor.ts) — Detects/strips 13 PII types before data reaches Claude
