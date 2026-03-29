@@ -1,0 +1,17 @@
+# Railway deployment configuration for WellnessMCP
+#
+# Deploys from the Dockerfile with a persistent volume for SQLite.
+# After deploying, create a volume in the Railway dashboard:
+#   Mount path: /data
+#
+# Set these environment variables in Railway:
+#   WELLNESS_MCP_INGEST_KEY=<your-secret-key>
+
+[build]
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/ingest/health/status"
+healthcheckTimeout = 10
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
