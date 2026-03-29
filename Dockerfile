@@ -50,6 +50,9 @@ RUN mkdir -p /data && \
 ENV DB_PATH=/data/data.db
 ENV WELLNESS_MCP_INGEST_PORT=3456
 ENV NODE_ENV=production
+# Ingest-only mode: skip MCP stdio server since there's no Claude client
+# attached in a remote deployment. Only the HTTP ingest endpoint runs.
+ENV INGEST_ONLY=true
 # HOME must be set for the keyfile fallback path resolution
 ENV HOME=/root
 
